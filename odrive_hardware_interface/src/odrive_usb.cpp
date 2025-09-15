@@ -34,87 +34,122 @@ ODriveUSB::~ODriveUSB()
 
 int ODriveUSB::init(const std::vector<std::vector<int64_t>> & serial_numbers)
 {
-  int ret = libusb_init(&libusb_context_);
-  if (ret != LIBUSB_SUCCESS) {
-    return ret;
+int ret = libusb_init(&libusb_context_);
+if (ret != LIBUSB_SUCCESS) {
+  std::cerr << "[ERROR] libusb_init failed with code: " << ret << std::endl;
+  return ret;
+}
+std::cout << "[INFO] libusb initialized successfully" << std::endl;
+
+libusb_device ** device_list;
+ssize_t device_count = libusb_get_device_list(libusb_context_, &device_list);
+if (device_count <= 0) {
+  std::cerr << "[ERROR] libusb_get_device_list returned " << device_count << std::endl;
+  return device_count;
+}
+std::cout << "[INFO] Found " << device_count << " USB devices" << std::endl;
+
+for (ssize_t i = 0; i < device_count; ++i) {
+  libusb_device * device = device_list[i];
+  libusb_device_descriptor descriptor;
+
+  if (libusb_get_device_descriptor(device, &descriptor) != LIBUSB_SUCCESS) {
+    std::cerr << "[WARN] Failed to get descriptor for device index " << i << std::endl;
+    continue;
   }
 
-  libusb_device ** device_list;
-  ssize_t device_count = libusb_get_device_list(libusb_context_, &device_list);
-  if (device_count <= 0) {
-    return device_count;
-  }
+  std::cout << "[DEBUG] Device " << i
+            << " VendorID: 0x" << std::hex << descriptor.idVendor
+            << " ProductID: 0x" << descriptor.idProduct << std::dec << std::endl;
 
-  for (ssize_t i = 0; i < device_count; ++i) {
-    libusb_device * device = device_list[i];
-    libusb_device_descriptor descriptor;
+  if (descriptor.idVendor == ODRIVE_USB_VENDORID &&
+      descriptor.idProduct == ODRIVE_USB_PRODUCTID) {
+    std::cout << "[INFO] Found ODrive device at index " << i << std::endl;
 
-    if (libusb_get_device_descriptor(device, &descriptor) != LIBUSB_SUCCESS) {
+    libusb_device_handle * device_handle;
+    if (libusb_open(device, &device_handle) != LIBUSB_SUCCESS) {
+      std::cerr << "[ERROR] Failed to open ODrive device" << std::endl;
       continue;
     }
+    std::cout << "[INFO] Successfully opened ODrive device" << std::endl;
 
-    if (
-      descriptor.idVendor == ODRIVE_USB_VENDORID && descriptor.idProduct == ODRIVE_USB_PRODUCTID) {
-      libusb_device_handle * device_handle;
-      if (libusb_open(device, &device_handle) != LIBUSB_SUCCESS) {
-        continue;
-      }
-      if (
-        (libusb_kernel_driver_active(device_handle, 2) != LIBUSB_SUCCESS) &&
+    if ((libusb_kernel_driver_active(device_handle, 2) != LIBUSB_SUCCESS) &&
         (libusb_detach_kernel_driver(device_handle, 2) != LIBUSB_SUCCESS)) {
-        libusb_close(device_handle);
-        continue;
-      }
-      if ((libusb_claim_interface(device_handle, 2)) != LIBUSB_SUCCESS) {
-        libusb_close(device_handle);
-        continue;
-      }
-      uint64_t serial_number;
-      if ((read(device_handle, SERIAL_NUMBER, serial_number)) != LIBUSB_SUCCESS) {
-        libusb_release_interface(device_handle, 2);
-        libusb_close(device_handle);
-        continue;
-      }
-      odrive_map_.insert(std::pair<int64_t, libusb_device_handle *>(-serial_number, device_handle));
+      std::cerr << "[ERROR] Failed to detach kernel driver from interface 2" << std::endl;
+      libusb_close(device_handle);
+      continue;
     }
-  }
+    std::cout << "[INFO] Kernel driver detached (if any)" << std::endl;
 
-  libusb_free_device_list(device_list, 1);
-  if (!odrive_map_.size()) {
-    return LIBUSB_ERROR_NO_DEVICE;
-  }
+    if ((libusb_claim_interface(device_handle, 2)) != LIBUSB_SUCCESS) {
+      std::cerr << "[ERROR] Failed to claim interface 2" << std::endl;
+      libusb_close(device_handle);
+      continue;
+    }
+    std::cout << "[INFO] Interface 2 claimed successfully" << std::endl;
 
-  if (odrive_map_.size() == 1) {
-    auto it = odrive_map_.begin();
-    odrive_map_.insert(std::pair<int64_t, libusb_device_handle *>(-it->first, it->second));
-    std::cout << "Connected to ODrive " << std::hex << -it->first << std::endl;
-    odrive_map_.erase(it);
-  } else {
-    for (size_t i = 0; i < 2; i++) {
-      for (size_t j = 0; j < serial_numbers[0].size(); j++) {
-        if (!odrive_map_.count(serial_numbers[i][j])) {
-          auto it = odrive_map_.find(-serial_numbers[i][j]);
-          if (it != odrive_map_.end()) {
-            odrive_map_.insert(std::pair<int64_t, libusb_device_handle *>(-it->first, it->second));
-            std::cout << "Connected to ODrive " << std::hex << -it->first << std::endl;
-            odrive_map_.erase(it);
-          } else {
-            return LIBUSB_ERROR_NO_DEVICE;
-          }
+    uint64_t serial_number;
+    if ((read(device_handle, SERIAL_NUMBER, serial_number)) != LIBUSB_SUCCESS) {
+      std::cerr << "[ERROR] Failed to read serial number" << std::endl;
+      libusb_release_interface(device_handle, 2);
+      libusb_close(device_handle);
+      continue;
+    }
+    std::cout << "[INFO] Read serial number: " << std::hex << serial_number << std::dec << std::endl;
+
+    odrive_map_.insert(std::make_pair(-serial_number, device_handle));
+    std::cout << "[INFO] Added ODrive with serial " << std::hex << serial_number
+              << " to odrive_map_" << std::dec << std::endl;
+  }
+}
+
+libusb_free_device_list(device_list, 1);
+if (!odrive_map_.size()) {
+  std::cerr << "[ERROR] No ODrive devices found" << std::endl;
+  return LIBUSB_ERROR_NO_DEVICE;
+}
+
+if (odrive_map_.size() == 1) {
+  auto it = odrive_map_.begin();
+  odrive_map_.insert(std::make_pair(-it->first, it->second));
+  std::cout << "[INFO] Connected to single ODrive with serial: "
+            << std::hex << -it->first << std::dec << std::endl;
+  odrive_map_.erase(it);
+} else {
+  for (size_t i = 0; i < 2; i++) {
+    for (size_t j = 0; j < serial_numbers[0].size(); j++) {
+      if (!odrive_map_.count(serial_numbers[i][j])) {
+        auto it = odrive_map_.find(-serial_numbers[i][j]);
+        if (it != odrive_map_.end()) {
+          odrive_map_.insert(std::make_pair(-it->first, it->second));
+          std::cout << "[INFO] Connected to ODrive with serial: "
+                    << std::hex << -it->first << std::dec << std::endl;
+          odrive_map_.erase(it);
+        } else {
+          std::cerr << "[ERROR] Expected ODrive serial "
+                    << std::hex << serial_numbers[i][j] << " not found" << std::dec << std::endl;
+          return LIBUSB_ERROR_NO_DEVICE;
         }
       }
     }
   }
+}
 
-  for (auto it = odrive_map_.begin(); it != odrive_map_.end(); it++) {
-    if (it->first < 0) {
-      libusb_release_interface(it->second, 2);
-      libusb_close(it->second);
-      odrive_map_.erase(it);
-    }
+for (auto it = odrive_map_.begin(); it != odrive_map_.end();) {
+  if (it->first < 0) {
+    std::cout << "[INFO] Cleaning up temporary entry for serial: "
+              << std::hex << -it->first << std::dec << std::endl;
+    libusb_release_interface(it->second, 2);
+    libusb_close(it->second);
+    it = odrive_map_.erase(it);  // update iterator after erase
+  } else {
+    ++it;
   }
+}
 
-  return LIBUSB_SUCCESS;
+std::cout << "[INFO] Successfully initialized ODrive devices" << std::endl;
+return LIBUSB_SUCCESS;
+
 }
 
 template <typename T>
