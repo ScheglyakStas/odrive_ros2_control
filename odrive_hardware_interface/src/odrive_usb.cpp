@@ -91,7 +91,7 @@ int ODriveUSB::init(const std::vector<std::vector<int64_t>> & serial_numbers)
     odrive_map_.erase(it);
   } else {
     for (size_t i = 0; i < 2; i++) {
-      for (size_t j = 0; j < serial_numbers[0].size(); j++) {
+      for (size_t j = 0; j < serial_numbers[i].size(); j++) {
         if (!odrive_map_.count(serial_numbers[i][j])) {
           auto it = odrive_map_.find(-serial_numbers[i][j]);
           if (it != odrive_map_.end()) {
