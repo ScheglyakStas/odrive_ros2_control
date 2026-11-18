@@ -106,15 +106,24 @@ int ODriveUSB::init(const std::vector<std::vector<int64_t>> & serial_numbers)
     }
   }
 
-  for (auto it = odrive_map_.begin(); it != odrive_map_.end(); it++) {
+  // The boards nobody asked for (still under their negated serial) are let go.
+  for (auto it = odrive_map_.begin(); it != odrive_map_.end(); ) {
     if (it->first < 0) {
       libusb_release_interface(it->second, 2);
       libusb_close(it->second);
-      odrive_map_.erase(it);
+      it = odrive_map_.erase(it);
+    } else {
+      ++it;
     }
   }
 
   return LIBUSB_SUCCESS;
+}
+
+bool ODriveUSB::connected(int64_t serial_number) const
+{
+  auto it = odrive_map_.find(serial_number);
+  return it != odrive_map_.end() && it->second != nullptr;
 }
 
 template <typename T>

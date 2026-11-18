@@ -42,6 +42,16 @@ ament_auto_add_library(
   src/odrive_hardware_interface.cpp
 )
 
+# Homes axes on their min endstops before the stack starts (warmup.sh).
+ament_auto_add_executable(
+  odrive_home
+  src/odrive_home.cpp
+)
+target_link_libraries(
+  odrive_home
+  odrive_usb
+)
+
 pluginlib_export_plugin_description_file(hardware_interface odrive_hardware_interface.xml)
 
 if(BUILD_TESTING)

@@ -50,6 +50,10 @@ public:
   int write(int64_t & serial_number, short endpoint_id, const T & value);
   int call(int64_t & serial_number, short endpoint_id);
 
+  // Whether init() opened the board with this serial number. With a single board plugged in,
+  // init() opens it whatever its serial: check before reading or writing by serial.
+  bool connected(int64_t serial_number) const;
+
 private:
   libusb_context * libusb_context_;
 
