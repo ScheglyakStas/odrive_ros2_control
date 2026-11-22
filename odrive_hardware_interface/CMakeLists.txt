@@ -52,6 +52,16 @@ target_link_libraries(
   odrive_usb
 )
 
+# Reads the battery's voltage from an ODrive before the stack starts (warmup.sh).
+ament_auto_add_executable(
+  odrive_vbus
+  src/odrive_vbus.cpp
+)
+target_link_libraries(
+  odrive_vbus
+  odrive_usb
+)
+
 pluginlib_export_plugin_description_file(hardware_interface odrive_hardware_interface.xml)
 
 if(BUILD_TESTING)
