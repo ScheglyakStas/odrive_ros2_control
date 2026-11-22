@@ -23,8 +23,17 @@
 // joints home at once, as at power-up: the
 // axis drives at controller.config.homing_speed onto its min endstop, which sets its position to
 // min_endstop.config.offset, then goes to 0 on its trapezoidal trajectory. Each homed axis is then
-// put in closed loop, holding 0, as config.startup_closed_loop_control does after a startup
-// homing; ODriveHardwareInterface takes it from there.
+// put in closed loop, as config.startup_closed_loop_control does after a startup homing, sent
+// back to 0 and held there; ODriveHardwareInterface takes it from there.
+//
+// A requested homing ends in idle (the firmware appends idle to any requested state; only the
+// startup sequence chains homing into closed loop, and on these boards it would also recalibrate
+// the motor and search the index again), so the motor is off from the homing's end until closed
+// loop is asked for. A loaded joint moves in that time (the hammer under gravity, the camera's
+// cable twist), and closed loop starts by holding wherever it finds the axis (a hammer homed
+// alone sat at -0.027 turns): ODriveHardwareInterface then holds that too. So each axis is asked
+// for closed loop on the very poll that sees its homing end (a few ms, not after the other axes
+// finish), then commanded to 0, and not reported holding until it is within SETTLE_TOLERANCE of 0.
 //
 // Errors standing on the board (a min endstop pressed outside homing drops the axis to idle with
 // MIN_ENDSTOP_PRESSED) are printed and cleared first. On a failure, the --timeout (30 s), SIGINT or
@@ -34,6 +43,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <fstream>
@@ -56,12 +66,20 @@ namespace
 constexpr int32_t AXIS_STATE_IDLE = 1;
 constexpr int32_t AXIS_STATE_CLOSED_LOOP_CONTROL = 8;
 constexpr int32_t AXIS_STATE_HOMING = 11;
+// Firmware 0.5.6's Controller.ControlMode.
+constexpr uint8_t CONTROL_MODE_POSITION_CONTROL = 3;
 
 constexpr char PLUGIN[] = "odrive_hardware_interface/ODriveHardwareInterface";
 constexpr auto POLL = std::chrono::milliseconds(20);
+// While homing: the time from a homing's end (motor off) to the closed-loop request is at most
+// this plus one state read per axis.
+constexpr auto HOMING_POLL = std::chrono::milliseconds(1);
 // From the request to the axis reporting HOMING (the board's state machine picks it up at its
 // next loop), and from a homing's end to it reporting CLOSED_LOOP_CONTROL.
 constexpr double STATE_CHANGE_TIMEOUT = 2.0;
+// Back at 0 after closed loop is entered: within this many turns, within SETTLE_TIMEOUT seconds.
+constexpr float SETTLE_TOLERANCE = 0.01f;
+constexpr double SETTLE_TIMEOUT = 2.0;
 
 std::atomic<bool> interrupted{false};
 
@@ -152,6 +170,14 @@ public:
     int ret = usb_.write(a.serial, a.ep(odrive::AXIS__REQUESTED_STATE), state);
     if (ret != 0) {
       throw UsbError(a.joint + ": requesting state " + std::to_string(state), ret);
+    }
+  }
+
+  void command_position(Axis & a, float turns)
+  {
+    int ret = usb_.write(a.serial, a.ep(odrive::AXIS__CONTROLLER__INPUT_POS), turns);
+    if (ret != 0) {
+      throw UsbError(a.joint + ": commanding position", ret);
     }
   }
 
@@ -362,7 +388,7 @@ int run(int argc, char ** argv)
         }
         return 1;
       }
-      std::this_thread::sleep_for(POLL);
+      std::this_thread::sleep_for(HOMING_POLL);
       for (auto & a : axes) {
         if (a.done) {
           continue;
@@ -371,6 +397,12 @@ int run(int argc, char ** argv)
         if (state == AXIS_STATE_HOMING) {
           a.homing_seen = true;
           continue;
+        }
+        if (a.homing_seen) {
+          // Homing over and the motor off: closed loop before anything else is read. A failed
+          // homing's errors make the board refuse it (adding INVALID_STATE), and it is put back
+          // in idle below.
+          board.request(a, AXIS_STATE_CLOSED_LOOP_CONTROL);
         }
         if (!a.homing_seen) {
           // Not picked up yet, or refused at once.
@@ -389,6 +421,7 @@ int run(int argc, char ** argv)
           if (!errors.empty() || !homed) {
             a.failed = true;
             a.result = errors.empty() ? "homing ended without is_homed" : errors;
+            board.request(a, AXIS_STATE_IDLE);
           } else {
             char took[48];
             std::snprintf(took, sizeof(took), "homed in %.1f s", seconds_since(start));
@@ -404,19 +437,13 @@ int run(int argc, char ** argv)
     throw;
   }
 
-  // Hold where homing left each axis (0), as the startup sequence's closed loop does.
+  // Closed loop holds wherever it found the axis: send it back to 0.
   bool ok = true;
+  auto hold_start = std::chrono::steady_clock::now();
   for (auto & a : axes) {
     if (a.failed) {
       std::cout << a.joint << ": FAILED: " << a.result << std::endl;
       ok = false;
-      continue;
-    }
-    board.request(a, AXIS_STATE_CLOSED_LOOP_CONTROL);
-  }
-  auto hold_start = std::chrono::steady_clock::now();
-  for (auto & a : axes) {
-    if (a.failed) {
       continue;
     }
     uint8_t state = 0;
@@ -428,13 +455,46 @@ int run(int argc, char ** argv)
       std::this_thread::sleep_for(POLL);
     }
     std::string errors = board.errors(a);
-    auto position = board.read<float>(a, odrive::AXIS__ENCODER__POS_ESTIMATE);
+    if (state != AXIS_STATE_CLOSED_LOOP_CONTROL || !errors.empty()) {
+      std::cout << a.joint << ": FAILED: " << a.result << ", but closed loop refused (state "
+                << std::to_string(state) << (errors.empty() ? "" : ", " + errors) << ")"
+                << std::endl;
+      a.failed = true;
+      ok = false;
+      continue;
+    }
+    auto mode = board.read<uint8_t>(a, odrive::AXIS__CONTROLLER__CONFIG__CONTROL_MODE);
+    if (mode != CONTROL_MODE_POSITION_CONTROL) {
+      std::cout << a.joint << ": FAILED: " << a.result << ", but controller.config.control_mode "
+                << "is " << std::to_string(mode) << ", not position control: it cannot hold 0"
+                << std::endl;
+      a.failed = true;
+      ok = false;
+      continue;
+    }
+    board.command_position(a, 0.0f);
+  }
+
+  auto settle_start = std::chrono::steady_clock::now();
+  for (auto & a : axes) {
+    if (a.failed) {
+      continue;
+    }
+    float position = board.read<float>(a, odrive::AXIS__ENCODER__POS_ESTIMATE);
+    while (std::abs(position) > SETTLE_TOLERANCE && seconds_since(settle_start) < SETTLE_TIMEOUT) {
+      std::this_thread::sleep_for(POLL);
+      position = board.read<float>(a, odrive::AXIS__ENCODER__POS_ESTIMATE);
+    }
+    std::string errors = board.errors(a);
     char at[32];
     std::snprintf(at, sizeof(at), "%.3f", position);
-    if (state != AXIS_STATE_CLOSED_LOOP_CONTROL || !errors.empty()) {
-      std::cout << a.joint << ": FAILED: " << a.result << " at " << at
-                << " turns, but closed loop refused (state " << std::to_string(state)
-                << (errors.empty() ? "" : ", " + errors) << ")" << std::endl;
+    if (!errors.empty()) {
+      std::cout << a.joint << ": FAILED: " << a.result << ", then " << errors << " at " << at
+                << " turns" << std::endl;
+      ok = false;
+    } else if (std::abs(position) > SETTLE_TOLERANCE) {
+      std::cout << a.joint << ": FAILED: " << a.result << ", but at " << at << " turns "
+                << SETTLE_TIMEOUT << " s after being commanded to 0" << std::endl;
       ok = false;
     } else {
       std::cout << a.joint << ": " << a.result << ", holding " << at << " turns" << std::endl;
