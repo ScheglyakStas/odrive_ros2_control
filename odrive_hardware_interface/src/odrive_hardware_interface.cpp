@@ -14,6 +14,8 @@
 
 #include "odrive_hardware_interface/odrive_hardware_interface.hpp"
 
+#include <algorithm>
+
 #include "pluginlib/class_list_macros.hpp"
 
 namespace odrive_hardware_interface
@@ -73,6 +75,7 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
   }
 
   control_level_.resize(info_.joints.size(), integration_level_t::UNDEFINED);
+  switching_.resize(info_.joints.size(), false);
   return CallbackReturn::SUCCESS;
 }
 
@@ -152,6 +155,22 @@ return_type ODriveHardwareInterface::prepare_command_mode_switch(
   const std::vector<std::string> & start_interfaces,
   const std::vector<std::string> & stop_interfaces)
 {
+  // A switch is made for one controller at a time (each spawner activates its own), and the
+  // joints it does not name must be left as they are: put in idle here (no controller yet), a
+  // joint homed by odrive_home lost its hold for as long as the other spawner took, and the
+  // camera's cable twist or the hammer's weight moved it off 0 before its own controller held
+  // wherever it had got to.
+  std::fill(switching_.begin(), switching_.end(), false);
+  for (const auto * keys : {&start_interfaces, &stop_interfaces}) {
+    for (const std::string & key : *keys) {
+      for (size_t i = 0; i < info_.joints.size(); i++) {
+        if (key.rfind(info_.joints[i].name + "/", 0) == 0) {
+          switching_[i] = true;
+        }
+      }
+    }
+  }
+
   for (std::string key : stop_interfaces) {
     for (size_t i = 0; i < info_.joints.size(); i++) {
       if (key.find(info_.joints[i].name) != std::string::npos) {
@@ -191,8 +210,12 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
   const std::vector<std::string> &, const std::vector<std::string> &)
 {
   for (size_t i = 0; i < info_.joints.size(); i++) {
+    if (!switching_[i]) {
+      continue;
+    }
     float input_torque, input_vel, input_pos;
     int32_t requested_state;
+    uint8_t current_state, control_mode;
 
     switch (control_level_[i]) {
       case integration_level_t::UNDEFINED:
@@ -240,9 +263,28 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
         break;
 
       case integration_level_t::POSITION:
-        hw_commands_positions_[i] = hw_positions_[i];
         hw_commands_velocities_[i] = 0;
         hw_commands_efforts_[i] = 0;
+        // An axis already holding a position in closed loop (odrive_home leaves it at 0) keeps
+        // that setpoint, not where it measures: re-entering closed loop would set its setpoint
+        // to the measured position and reset its integrator, and a loaded joint sags while the
+        // integrator builds up again.
+        CHECK_RW(odrive->read(
+          serial_numbers_[1][i], AXIS__CURRENT_STATE + per_axis_offset * axes_[i],
+          current_state));
+        CHECK_RW(odrive->read(
+          serial_numbers_[1][i],
+          AXIS__CONTROLLER__CONFIG__CONTROL_MODE + per_axis_offset * axes_[i], control_mode));
+        if (current_state == AXIS_STATE_CLOSED_LOOP_CONTROL &&
+          control_mode == (uint8_t)integration_level_t::POSITION)
+        {
+          CHECK_RW(odrive->read(
+            serial_numbers_[1][i], AXIS__CONTROLLER__INPUT_POS + per_axis_offset * axes_[i],
+            input_pos));
+          hw_commands_positions_[i] = input_pos * 2 * M_PI;
+          break;
+        }
+        hw_commands_positions_[i] = hw_positions_[i];
         CHECK_RW(odrive->write(
           serial_numbers_[1][i],
           AXIS__CONTROLLER__CONFIG__CONTROL_MODE + per_axis_offset * axes_[i],
@@ -266,6 +308,7 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
         break;
     }
   }
+  std::fill(switching_.begin(), switching_.end(), false);
 
   return return_type::OK;
 }

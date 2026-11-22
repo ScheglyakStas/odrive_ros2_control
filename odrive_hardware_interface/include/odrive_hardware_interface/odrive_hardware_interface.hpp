@@ -117,5 +117,7 @@ private:
   };
 
   std::vector<integration_level_t> control_level_;
+  // Joints named in the switch being prepared: perform_command_mode_switch touches only these.
+  std::vector<bool> switching_;
 };
 }  // namespace odrive_hardware_interface
